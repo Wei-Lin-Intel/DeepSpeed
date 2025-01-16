@@ -307,7 +307,9 @@ class AutoTP():
                     gem_list = gem_list + [layer]
                 elif 'o_proj' in layer:
                     gem_list = gem_list + [layer]
-                elif 'down_proj' in layer:
+                elif 'down_proj' in layer and not ('qwen2_moe' in str(type(module))):
+                    gem_list = gem_list + [layer]
+                elif 'shared_expert.down_proj' in layer:
                     gem_list = gem_list + [layer]
                 elif 'attention.dense' in layer and 'GPTNeoX' in str(model):
                     gem_list = gem_list + [layer]
@@ -395,22 +397,29 @@ class AutoTP():
                     prepare_tp_fused_qkvw(self.module, child.bias.data, self.mp_size, mp_replace.gpu_index),
                     get_accelerator().current_device_name(), self.keep_module_on_host)
             else:
-                data = child.weight.data.split(get_shard_size_list(weight_shape[0], self.mp_size, name),
-                                               dim=1 if self.conv_linear_layer else 0)
-                data_dc = move(data[mp_replace.gpu_index],
-                               get_accelerator().current_device_name(), self.keep_module_on_host).detach()
-                del data
-
-                if child.bias is not None:
-                    bias_data = child.bias.data.split(get_shard_size_list(
-                        weight_shape[1] if self.conv_linear_layer else weight_shape[0], self.mp_size, name),
-                                                      dim=0)
-                    bias_data = move(bias_data[mp_replace.gpu_index],
-                                     get_accelerator().current_device_name(), self.keep_module_on_host)
-                    bias_data_dc = torch.nn.parameter.Parameter(bias_data, requires_grad=False)
-                    del bias_data
+                if ('shared_expert.down_proj' not in name and 'down_proj' in name and 'qwen2_moe' in str(type(self.module))):
+                    data = child.weight.data.split(get_shard_size_list(weight_shape[1], self.mp_size), dim=1)
+                    data_dc = move(data[mp_replace.gpu_index], get_accelerator().current_device_name()).detach()
+                    del data
+                    bias_data_dc = None if child.bias is None else \
+                        torch.nn.parameter.Parameter(move(child.bias, get_accelerator().current_device_name()))
                 else:
-                    bias_data_dc = None
+                    data = child.weight.data.split(get_shard_size_list(weight_shape[0], self.mp_size, name),
+                                                   dim=1 if self.conv_linear_layer else 0)
+                    data_dc = move(data[mp_replace.gpu_index],
+                                   get_accelerator().current_device_name(), self.keep_module_on_host).detach()
+                    del data
+
+                    if child.bias is not None:
+                        bias_data = child.bias.data.split(get_shard_size_list(
+                            weight_shape[1] if self.conv_linear_layer else weight_shape[0], self.mp_size, name),
+                                                          dim=0)
+                        bias_data = move(bias_data[mp_replace.gpu_index],
+                                         get_accelerator().current_device_name(), self.keep_module_on_host)
+                        bias_data_dc = torch.nn.parameter.Parameter(bias_data, requires_grad=False)
+                        del bias_data
+                    else:
+                        bias_data_dc = None
 
             setattr(child, "replaced", True)
             return LinearLayer(weight=torch.nn.parameter.Parameter(data_dc, requires_grad=False), bias=bias_data_dc)
@@ -481,8 +490,9 @@ class AutoTP():
             if len(child._buffers) != 0 and self.state_dict is not None:
                 Loading.load_buffer(child, self.state_dict, checking_key)
             if child.__class__ in self.linear_policies:
-                setattr(r_module, name, self.linear_policies[child.__class__](child, prev_name + '.' + name,
-                                                                              self.conv_linear_layer))
+                if ('shared_expert_gate' not in checking_key and '.gate.' not in checking_key and 'qwen2_moe' in str(type(r_module))) or 'qwen2_moe' not in str(type(r_module)):
+                    setattr(r_module, name, self.linear_policies[child.__class__](child, prev_name + '.' + name,
+                                                                                  self.conv_linear_layer))
             elif any(isinstance(child, lp) for lp in self.linear_policies):
                 # Added for falcon model support
                 # Note: isinstance will account for class inheritance, child.__class__ does not
